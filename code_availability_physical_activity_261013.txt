@@ -1,0 +1,277 @@
+################### 1. Taxonomic profiling #####################
+#1-1. Taxonomic profiling using MetaPhlAn4 [v.4.0.6]
+#!/usr/bin/bash
+
+INPUT_DIR="/path/to/QC_finished_cleaned_fastq_files"    
+OUTPUT_DIR="/path/to/metaphlan_results"
+DB_PATH="/path/to/metaphlan_db" # (e.g., mpa_vOct22_CHOCOPhlAnSGB_202212)
+THREADS= "Threads"
+
+mkdir -p "${OUTPUT_DIR}"
+
+for fq in "${INPUT_DIR}"/*.fastq.gz; do
+    [ -e "$fq" ] || continue
+
+    # Extract sample name
+    sample=$(basename "$fq" .fastq.gz)
+
+    echo "Running MetaPhlAn4 for ${sample}..."
+
+    metaphlan "$fq" \
+        --input_type fastq \
+        --nproc "${THREADS}" \
+        --bowtie2db "${DB_PATH}" \
+        --bowtie2out "${OUTPUT_DIR}/${sample}_bowtie2.txt" \
+        -o "${OUTPUT_DIR}/${sample}_sgb_profile.txt"
+
+    echo "Finished ${sample}"
+done
+
+#1-2.  Merging feature tables of all samples using HUMAnN3 [v.3.0]
+merge_metaphlan_tables.py "/path/to/metaphlan_results"/*_sgb_profile.txt \
+    > "/path/to/metaphlan_results"/merged_sgb_feature_table.txt
+
+#1-3. Conversion SGB profiles into GTDB profiles using HUMAnN3 [v.3.0]
+
+sgb_to_gtdb_profile.py \
+    -i "/path/to/metaphlan_results"/merged_sgb_feature_table.txt \
+    -d "/path/to/SGB2GTDB/indexing/file"   # (e.g.,mpa_vOct22_CHOCOPhlAnSGB_202212_SGB2GTDB.tsv) \
+    -o "/path/to/metaphlan_results"/merged_gtdb_feature_table.txt
+
+################### 2. Functional profiling #####################
+#2-1. Functional profiling using HUMAnN3 [v.3.0]
+#!/usr/bin/bash
+
+INPUT_DIR="/path/to/QC_finished_cleaned_fastq_files"
+OUTPUT_DIR="/path/to/humann_results"
+NUC_DB="/path/to/chocophlan_db"     # (e.g., chocophlan db v201901_v31)
+PROT_DB="/path/to/uniref_db"        # (e.g., uniref90_201901b_full.dmnd)
+THREADS="Threads"
+
+mkdir -p "${OUTPUT_DIR}"
+
+for fq in "${INPUT_DIR}"/*.fastq.gz; do
+    [ -e "$fq" ] || continue
+
+    # Extract sample name
+    sample=$(basename "$fq" .fastq.gz)
+
+    echo "Running HUMAnN for ${sample}..."
+
+    humann \
+        --input "${fq}" \
+        --output "${OUTPUT_DIR}/${sample}_humann" \
+        --threads "${THREADS}" \
+        --nucleotide-database "${NUC_DB}" \
+        --protein-database "${PROT_DB}"
+
+    echo "Finished ${sample}"
+done
+
+#2-2. Normalization of metabolic pathway (MetaCyc) feature tables
+#!/usr/bin/bash
+
+INPUT_DIR="/path/to/humann_results"
+OUTPUT_DIR="/path/to/humann_results_normalized"
+mkdir -p "${OUTPUT_DIR}"
+
+for tsv in "${INPUT_DIR}"/*_humann/*_pathabundance.tsv; do
+    [ -e "$tsv" ] || continue
+
+    sample=$(basename "$tsv" _pathabundance.tsv)
+
+    echo "Normalizing HUMAnN pathabundance table for ${sample}..."
+
+    humann_renorm_table \
+        --input "${tsv}" \
+        --output "${OUTPUT_DIR}/${sample}_pathabundance_relab.tsv" \
+        --units relab
+
+    echo "Finished ${sample}"
+done
+
+#2-3. Merging metabolic pathways feature tables of all samples using HUMAnN3 [v.3.0]
+merge_metaphlan_tables.py "/path/to/humann_results_normalized"/*_pathabundance_relab.tsv \
+    > "/path/to/humann_results_normalized"/merged_pwy_normalized_feature_table.txt
+
+#2-4. Generating stratified relative abundance bar plots for visualization of species-level contributions to metabolic pathways using HUMAnN3 [v.3.0]
+humann_barplot \
+  --input "merged_pwy_normalized_feature_table_with_metadata" \
+  --last-metadata "last_metadata_name" \ # e.g., sex
+  --focal-feature "focal_feature" \ # e.g., PWY-5667
+  --focal-metadata "focal_metadata" \ # e.g., group
+  --sort sum metadata \
+  --exclude-unclassified \
+  --output "output" \
+  --scaling logstack
+
+#2-5. Normalization of genefamily (UniRef90) feature tables using HUMAnN3 [v.3.0]
+#!/usr/bin/bash
+
+INPUT_DIR="/path/to/humann_results"
+OUTPUT_DIR="/path/to/humann_results_normalized"
+mkdir -p "${OUTPUT_DIR}"
+
+for tsv in "${INPUT_DIR}"/*_humann/*_genefamilies.tsv; do
+    [ -e "$tsv" ] || continue
+
+    sample=$(basename "$tsv" _genefamilies.tsv)
+
+    echo "Normalizing HUMAnN genefamilies table for ${sample}..."
+
+    humann_renorm_table \
+        --input "${tsv}" \
+        --output "${OUTPUT_DIR}/${sample}_genefamilies_relab.tsv" \
+        --units relab
+
+    echo "Finished ${sample}"
+done
+
+#2-6. Merging metabolic pathways feature tables of all samples using HUMAnN3 [v.3.0]
+merge_metaphlan_tables.py "/path/to/humann_results_normalized"/*_genefamilies_relab.tsv \
+    > "/path/to/humann_results_normalized"/merged_uniref90_normalized_feature_table.txt
+
+#2-7. Predicting metabolite composition using MelonnPan
+# This step was performed in the R environment using the R packages, MelonnPan, based on normalized genefamily (UniRef90) feature tables as input. 
+library(melonnpan)
+input <- read.delim(""/path/to/humann_results_normalized"/merged_uniref90_normalized_feature_table.txt", row.names=1)
+t_input <- t(input) # samples in rows
+melonnpan.predict (t_input, "/path/to/melonnpan_results")
+
+#2-8. Functional module profiling with the curated gut metabolic module (GMMs, v1.07) and gut-brain module (GBM, v1.0) using Omixer-RPM (v0.3.2)
+# This step was performed in the R environment using the R packages, omixer-rpmR, based on normalized genefamily (UniRef90) feature tables as input. 
+library(omixerRpm)
+dat <-read.table(""/path/to/humann_results_normalized"/merged_uniref90_normalized_feature_table.txt", header=T, row.names=NULL, sep="\t")
+db <- loadDefaultDB() # Loaded GMMs.v1.07
+result_gmm <- rpm(dat, module.db = db, minimum.coverage=0.333, annotation = 1)
+result_gmm_df <- asDataFrame(result_gmm, "abundance")
+result_gmm_df2 <- asDataFrame(result_gmm, "coverage")
+write.table(result_gmm_df, "/path/to/humann_results_normalized/gmm_abundance.txt", sep="\t", row.names=FALSE)
+write.table(result_gmm_df2, "/path/to/humann_results_normalized/gmm_coverage.txt", sep="\t", row.names=FALSE)
+
+db2 <- loadDB("GBMs.v1.0")
+result_gbm <- rpm(dat, module.db = db2, minimum.coverage=0.333, annotation = 1)
+result_gbm_df <- asDataFrame(result_gbm, "abundance")
+result_gbm_df2 <- asDataFrame(result_gbm, "coverage")
+write.table(result_gbm_df, "/path/to/humann_results_normalized/gbm_abundance.txt", sep="\t", row.names=FALSE)
+write.table(result_gbm_df2, "/path/to/humann_results_normalized/gbm_coverage.txt", sep="\t", row.names=FALSE)
+
+################### 3. Statistical analysis #####################
+#3-1. Diversity analysis for bacterial species
+#3-1-1. Alpha diversity analysis
+Rscript calculate_diversity.R --file merged_gtdb_feature_table.txt --out_directory "/path/to/alpha_indices" --diversity alpha --metric richness -s "s__"
+Rscript calculate_diversity.R --file merged_gtdb_feature_table.txt --out_directory "/path/to/alpha_indices" --diversity alpha --metric shannon -s "s__"
+Rscript calculate_diversity.R --file merged_gtdb_feature_table.txt --out_directory "/path/to/alpha_indices" --diversity alpha --metric gini -s "s__"
+
+# This step was performed in the R environment using the R packages, emmeans.
+library(emmeans)
+alpha_diversity <- read.delim("alpha_diversity_table_with_metadata")
+
+summary(aov(lm(observed~Group,data="alpha_diversity"))) # without adjustments for covariates
+summary(aov(lm(gini~Group,data="alpha_diversity"))) # without adjustments for covariates
+summary(aov(lm(shannon~Group,data=alpha_diversity))) # without adjustments for covariates
+
+summary(aov(lm(observed~age+BMI+sex+Group,data=alpha_diversity))) # with adjustments for covariates
+summary(aov(lm(gini~age+BMI+sex+Group,data=alpha_diversity))) # with adjustments for covariates
+summary(aov(lm(shannon~age+BMI+sex+Group,data=alpha_diversity))) # with adjustments for covariates
+
+summary(emmeans(aov(lm(observed~Group,data=alpha_diversity)),pairwise~Group,adjust = "BH"))  # post hoc pairwise comparison analysis without adjustments for covariates
+summary(emmeans(aov(lm(shannon~Group,data=alpha_diversity)),pairwise~Group,adjust = "BH"))  # post hoc pairwise comparison analysis without adjustments for covariates
+summary(emmeans(aov(lm(gini~Group,data=alpha_diversity)),pairwise~Group,adjust = "BH"))  # post hoc pairwise comparison analysis without adjustments for covariates
+
+summary(emmeans(aov(lm(observed~age+BMI+sex+Group,data=alpha_diversity)),pairwise~Group,adjust = "BH")) # post hoc pairwise comparison analysis with adjustments for covariates
+summary(emmeans(aov(lm(shannon~age+BMI+sex+Group,data=alpha_diversity)),pairwise~Group,adjust = "BH")) # post hoc pairwise comparison analysis with adjustments for covariates
+summary(emmeans(aov(lm(gini~age+BMI+sex+Group,data=alpha_diversity)),pairwise~Group,adjust = "BH")) # post hoc pairwise comparison analysis with adjustments for covariates
+
+
+
+#3-1-2. Beta diversity analysis
+Rscript calculate_diversity.R --file merged_gtdb_feature_table.txt --out_directory "/path/to/beta_indices" --diversity beta --metric aitchisn -s "s__"
+
+# This step was performed in the R environment using the R packages, vegan, readr, and dplyr.
+library(vegan)
+library(dplyr) 
+library(readr)
+
+beta_aitchison <- read_tsv("aitchison_distance_matrics.tsv",skip=1, col_names=FALSE)
+metadata<-read.delim("metadata.txt")
+colnames(beta_aitchison) <- c("sampleID", beta_aitchison$X1)
+meta_aitchison <-inner_join(metadata, beta_aitchison, by="sampleID")
+
+all_dist_aitchison <- meta_aitchison %>%
+select(all_of(.[["sampleID"]])) %>%
+as.dist()
+
+all_aitchison_permanova <- adonis2(all_dist_aitchison~Group,data=meta_aitchison,permutations=999, by="term") # without adjustments for covariates
+all_aitchison_permanova_cov <- adonis2(all_dist_aitchison~ sex+age+BMI + Group, data = meta_aitchison,permutations=999, by = "term") # with adjustments for covariates
+
+#3-2. Differential analysis for bacterial species, MetaCyc metabolic pathways, GMMs, and predicted metabolites using MaAsLin2
+# This step was performed in the R environment using the R package, Maaslin2.
+#3-2-1.Differential analysis for bacterial species
+library(Maaslin2) 
+input_metadata <- read.delim("metadata.txt", row.names=1)
+input_data <- read.delim("feature_table.txt", row.names=1) # e.g., relative abundance table of bacterial species
+fit_data = Maaslin2(input_data     = input_data, 
+                    input_metadata = input_metadata, transform = "LOG",
+        analysis_method = "LM",random_effects = NULL,  
+        correction = "BH",    standardize = TRUE,  cores = 7,                     
+                    normalization  = "NONE",
+                    output         = "output_file_directory", 
+                    min_abundance = 0.001,
+                    min_prevalence = 0.01,
+                    fixed_effects  = c("age,sex,BMI,Group"), # e.g., with adjustments for covariates
+                    reference      = c("Group,reference"))
+
+#3-2-2.Differential analysis for MetaCyc metabolic pathways, GMMs, and predicted metabolites
+library(Maaslin2) 
+input_metadata <- read.delim("metadata.txt", row.names=1)
+input_data <- read.delim("feature_table.txt", row.names=1) # e.g., relative abundance table of MetaCyc metabolic pathways, GMMs, and predicted metabolites
+fit_data = Maaslin2(input_data     = input_data, 
+                    input_metadata = input_metadata, transform = "LOG",
+                    analysis_method = "LM",random_effects = NULL,  
+                    correction = "BH",    standardize = TRUE,  cores = 7,                     
+                    normalization  = "NONE",
+                    output         = "output_file_directory", 
+                    min_abundance = 0.0,
+                    min_prevalence = 0.01,
+                    fixed_effects  = c("age,sex,BMI,Group"), # e.g., with adjustments for covariates
+                    reference      = c("Group,reference"))
+
+#3-3. Correlation analysis for differential abundant bacterial species, MetaCyc metabolic pathways, GMMs, and predicted metabolites
+# This step was performed in the R environment using the R package, Hmisc.
+library(Hmisc)
+feature_table <- read.delim("feature_table.txt", row.names = 1) # e.g., a concatenated feature matrix including relative abundance of differential abundant bacterial species, metabolic pathways and predicted metabolites
+corr_output <- rcorr(as.matrix(feature_table), type = "spearman")
+cormat <- as.matrix(corr_output$r)
+pmat   <- as.matrix(corr_output$P)
+upper_idx <- upper.tri(pmat, diag = FALSE)
+pvals_vec <- pmat[upper_idx]
+valid_idx <- !is.na(pvals_vec)
+pvals_vec_valid <- pvals_vec[valid_idx]
+qvals_vec_valid <- p.adjust(pvals_vec_valid, method = "BH")
+qmat <- matrix(NA, nrow = nrow(pmat),  ncol = ncol(pmat), dimnames = dimnames(pmat))
+qmat[upper_idx][valid_idx] <- qvals_vec_valid
+qmat <- t(qmat)
+qmat[upper_idx][valid_idx] <- qvals_vec_valid
+diag(qmat) <- NA
+cormat
+qmat
+
+#3-4. Mediation analysis
+# This step was performed in the R environment using the R package, mediation.
+library(mediation)
+dat <- read.delim("metadata_with_clinical_phenotype_and_bacterial_taxa_feature_table.txt",check.names=FALSE")
+mediator <-"taxon_name"
+outcome <-"phenotype_name"
+med_model <-lm(reformulate(c("age","sex","BMI","Group"),response=mediator),data=dat)
+out_model <-lm(reformulate(c("age","sex","BMI","mediator"),response=outcome),data=dat)
+med_result <-mediate(
+    med_model,
+    out_model,
+    treat="Group",
+    mediator=mediator,
+    control.value="reference_group"
+    treat.value="treat_group",
+    boot=TRUE,
+    sims=500)
+summary(med_result)
